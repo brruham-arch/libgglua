@@ -3,10 +3,12 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <cctype>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -22,15 +24,17 @@ struct TInfo { const char* name; int size; bool fp; };
 static const TInfo TI[NT] = {{"i8",1,false},{"i16",2,false},{"i32",4,false},{"i64",8,false},{"f32",4,true},{"f64",8,true}};
 
 static lua_State* L = nullptr;
-static int memfd = -1;
-static std::mutex G, FM;
+static std::mutex G, FM, RM, WM;
 static std::string outbuf, initMsg, spec = "anon";
 
 struct Hit { uint64_t addr, old; };
-static std::vector<Hit> hits;
+static Hit* H = nullptr;          // array hasil di mmap (supaya tidak ikut ter-scan)
+static size_t HN = 0;
 static int curType = I32;
 static const size_t MAXHITS = 3000000;
 static const size_t CHUNK = 1 << 20;
+static const size_t PIPE_CH = 32768;
+static int rp[2] = {-1, -1}, wp[2] = {-1, -1};
 
 /* ---------- util tipe ---------- */
 static int getType(lua_State* s, int idx) {
@@ -38,11 +42,6 @@ static int getType(lua_State* s, int idx) {
     for (int i = 0; i < NT; i++) if (!strcmp(n, TI[i].name)) return i;
     luaL_error(s, "tipe tidak dikenal: %s (i8 i16 i32 i64 f32 f64)", n);
     return 0;
-}
-
-static bool readRaw(uint64_t a, int t, uint64_t& raw) {
-    raw = 0;
-    return pread64(memfd, &raw, TI[t].size, (off64_t)a) == TI[t].size;
 }
 
 static void pushVal(lua_State* s, int t, uint64_t raw) {
@@ -117,7 +116,7 @@ static inline bool matchRaw(const Cond& c, const uint8_t* p) {
     }
 }
 
-/* ---------- maps ---------- */
+/* ---------- maps & region ---------- */
 struct Region { uint64_t s, e; std::string perms, path; };
 
 static std::vector<Region> readMaps() {
@@ -138,16 +137,144 @@ static std::vector<Region> readMaps() {
     return v;
 }
 
-static bool wanted(const Region& r) {
+// kelas region ala GG: ca=C++ alloc, ch=[heap], cb=.bss, cd=.data lib, cs=stack, a=anon, j=java, o=lainnya
+enum { C_CA, C_CH, C_CB, C_CD, C_CS, C_A, C_J, C_O, NC };
+static const char* CN[NC] = {"ca", "ch", "cb", "cd", "cs", "a", "j", "o"};
+static inline unsigned bit(int c) { return 1u << c; }
+static unsigned gmask = 0;
+static std::vector<std::string> gsubs;
+
+static int classify(const Region& r) {
+    const std::string& p = r.path;
+    if (p.empty()) return C_A;
+    auto has = [&](const char* x) { return p.find(x) != std::string::npos; };
+    if (p == "[heap]") return C_CH;
+    if (p.compare(0, 6, "[stack") == 0) return C_CS;
+    if (p[0] == '[') {
+        if (has("scudo") || has("libc_malloc") || has("jemalloc")) return C_CA;
+        if (has(".bss")) return C_CB;
+        if (has("dalvik")) return C_J;
+        return C_A;
+    }
+    if (has("dalvik") || (p.size() > 4 && p.compare(p.size() - 4, 4, ".art") == 0)) return C_J;
+    if (has(".so")) return C_CD;
+    return C_O;
+}
+
+// spec: gabungan dengan + , ; spasi. kode: ca ch cb cd cs a j o | all anon native | selain itu = substring path file
+static void setSpec(const std::string& v) {
+    gmask = 0;
+    gsubs.clear();
+    size_t i = 0;
+    while (i <= v.size()) {
+        size_t j = v.find_first_of("+,; ", i);
+        if (j == std::string::npos) j = v.size();
+        std::string tk = v.substr(i, j - i);
+        i = j + 1;
+        if (tk.empty()) continue;
+        std::string lc = tk;
+        for (auto& ch : lc) ch = (char)tolower((unsigned char)ch);
+        if (lc == "all") { gmask = (1u << NC) - 1; continue; }
+        if (lc == "anon") { gmask |= bit(C_A) | bit(C_CA) | bit(C_CH) | bit(C_CB) | bit(C_CS) | bit(C_J); continue; }
+        if (lc == "native") { gmask |= bit(C_A) | bit(C_CA) | bit(C_CH) | bit(C_CB) | bit(C_CS); continue; }
+        bool code = false;
+        for (int k = 0; k < NC; k++) if (lc == CN[k]) { gmask |= bit(k); code = true; break; }
+        if (!code) gsubs.push_back(tk);
+    }
+}
+
+static bool rwBase(const Region& r) {
     if (r.perms[0] != 'r' || r.perms[1] != 'w') return false;
     const std::string& p = r.path;
     if (p.find("/dev/") != std::string::npos) return false;
     if (p.compare(0, 5, "[vvar") == 0 || p.compare(0, 5, "[vdso") == 0) return false;
-    bool anon = p.empty() || p[0] == '[';
-    if (spec == "all") return true;
-    if (spec == "anon") return anon;
-    if (spec == "native") return anon && p.find("dalvik") == std::string::npos;
-    return !anon && p.find(spec) != std::string::npos;
+    return true;
+}
+
+static bool wanted(const Region& r) {
+    if (!rwBase(r)) return false;
+    int c = classify(r);
+    if (gmask & bit(c)) return true;
+    if (c == C_CD || c == C_O) {
+        for (auto& sub : gsubs) if (r.path.find(sub) != std::string::npos) return true;
+    }
+    return false;
+}
+
+/* ---------- akses memori via pipe (tanpa /proc/self/mem) ---------- */
+// kernel mengembalikan EFAULT untuk alamat tidak valid, jadi tidak crash
+static void drain(int fd) { char t[4096]; while (read(fd, t, sizeof t) > 0) {} }
+
+static size_t memRead(uint64_t addr, void* dst, size_t len) {
+    std::lock_guard<std::mutex> g(RM);
+    if (rp[0] < 0) return 0;
+    uint8_t* d = (uint8_t*)dst;
+    size_t done = 0;
+    while (done < len) {
+        size_t n = std::min(PIPE_CH, len - done);
+        ssize_t w = write(rp[1], (const void*)(uintptr_t)(addr + done), n);
+        if (w <= 0) break;
+        size_t got = 0;
+        while (got < (size_t)w) {
+            ssize_t r = read(rp[0], d + done + got, (size_t)w - got);
+            if (r <= 0) break;
+            got += (size_t)r;
+        }
+        if (got < (size_t)w) drain(rp[0]);
+        done += got;
+        if (got < n) break;
+    }
+    return done;
+}
+
+static bool memWriteFast(uint64_t addr, const void* src, size_t len) {
+    if (len == 0 || len > PIPE_CH) return false;
+    std::lock_guard<std::mutex> g(WM);
+    if (wp[0] < 0) return false;
+    if (write(wp[1], src, len) != (ssize_t)len) { drain(wp[0]); return false; }
+    ssize_t r = read(wp[0], (void*)(uintptr_t)addr, len);
+    if (r == (ssize_t)len) return true;
+    drain(wp[0]);
+    return false;
+}
+
+// jalur lambat: halaman tidak writable -> mprotect sementara
+static bool memWriteForce(uint64_t addr, const void* src, size_t len) {
+    for (auto& r : readMaps()) {
+        if (addr >= r.s && addr + len <= r.e) {
+            if (r.perms[0] != 'r') return false;
+            uint64_t ps = (uint64_t)sysconf(_SC_PAGESIZE);
+            uint64_t pa = addr & ~(ps - 1);
+            uint64_t pe = (addr + len + ps - 1) & ~(ps - 1);
+            int orig = PROT_READ | (r.perms[1] == 'w' ? PROT_WRITE : 0) | (r.perms[2] == 'x' ? PROT_EXEC : 0);
+            if (mprotect((void*)(uintptr_t)pa, (size_t)(pe - pa), orig | PROT_WRITE) != 0) return false;
+            memcpy((void*)(uintptr_t)addr, src, len);
+            mprotect((void*)(uintptr_t)pa, (size_t)(pe - pa), orig);
+            if (r.perms[2] == 'x') __builtin___clear_cache((char*)(uintptr_t)addr, (char*)(uintptr_t)(addr + len));
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool memWrite(uint64_t addr, const void* src, size_t len) {
+    return memWriteFast(addr, src, len) || memWriteForce(addr, src, len);
+}
+
+static bool readRaw(uint64_t a, int t, uint64_t& raw) {
+    raw = 0;
+    return memRead(a, &raw, (size_t)TI[t].size) == (size_t)TI[t].size;
+}
+
+static std::string probeText() {
+    static volatile int32_t tv = 0x12345678;
+    int32_t got = 0;
+    uint64_t addr = (uint64_t)(uintptr_t)&tv;
+    bool rd = memRead(addr, &got, 4) == 4 && got == 0x12345678;
+    int32_t nv = 0x0badf00d;
+    bool wr = memWrite(addr, &nv, 4) && tv == 0x0badf00d;
+    tv = 0x12345678;
+    return std::string("io: baca ") + (rd ? "ok" : "GAGAL") + ", tulis " + (wr ? "ok" : "GAGAL") + "\n";
 }
 
 /* ---------- API Lua ---------- */
@@ -167,12 +294,33 @@ static int l_print(lua_State* s) {
 static int l_ranges(lua_State* s) {
     std::string v = luaL_optstring(s, 1, spec.c_str());
     spec = v;
+    setSpec(v);
     size_t n = 0, bytes = 0;
     for (auto& r : readMaps()) if (wanted(r)) { n++; bytes += r.e - r.s; }
     lua_pushinteger(s, (lua_Integer)n);
     lua_pushnumber(s, bytes / 1048576.0);
     return 2;
 }
+
+static int l_regions(lua_State*) {
+    size_t cnt[NC] = {0};
+    double mb[NC] = {0};
+    for (auto& r : readMaps()) {
+        if (!rwBase(r)) continue;
+        int c = classify(r);
+        cnt[c]++;
+        mb[c] += (r.e - r.s) / 1048576.0;
+    }
+    char b[96];
+    for (int i = 0; i < NC; i++) {
+        snprintf(b, sizeof b, "%-3s %5zu region %9.1f MB\n", CN[i], cnt[i], mb[i]);
+        outbuf += b;
+    }
+    outbuf += "aktif: " + spec + "\n";
+    return 0;
+}
+
+static int l_probe(lua_State*) { outbuf += probeText(); return 0; }
 
 static int l_maps(lua_State* s) {
     const char* f = luaL_optstring(s, 1, "");
@@ -201,40 +349,55 @@ static int l_search(lua_State* s) {
     int t = getType(s, 2);
     Cond c;
     parseCond(s, 1, t, c);
-    hits.clear();
+    if (!H) return luaL_error(s, "array hasil gagal dialokasikan");
+    HN = 0;
     curType = t;
     int sz = TI[t].size;
     bool trunc = false;
+    size_t rdOK = 0, rdFail = 0;
     std::vector<uint8_t> buf(CHUNK);
-    uint64_t b0 = (uint64_t)buf.data(), b1 = b0 + buf.size();
+    uint64_t b0 = (uint64_t)(uintptr_t)buf.data(), b1 = b0 + buf.size();
+    uint64_t hb = (uint64_t)(uintptr_t)H, he = hb + (uint64_t)MAXHITS * sizeof(Hit);
     for (auto& r : readMaps()) {
         if (!wanted(r)) continue;
         uint64_t a = (r.s + sz - 1) / sz * sz;
         while (a + sz <= r.e && !trunc) {
-            size_t want = (size_t)std::min<uint64_t>(CHUNK, r.e - a);
+            if (a >= hb && a < he) { a = he; continue; }
+            uint64_t lim = r.e;
+            if (a < hb && hb < lim) lim = hb;
+            size_t want = (size_t)std::min<uint64_t>(CHUNK, lim - a);
             want -= want % sz;
             if (!want) break;
-            ssize_t n = pread64(memfd, buf.data(), want, (off64_t)a);
-            size_t adv = want;
-            if (n > 0) {
-                size_t usable = (size_t)n - ((size_t)n % sz);
+            size_t n = memRead(a, buf.data(), want);
+            size_t adv;
+            if (n >= (size_t)sz) {
+                rdOK += n;
+                size_t usable = n - (n % sz);
                 for (size_t o = 0; o < usable; o += sz) {
                     if (!matchRaw(c, &buf[o])) continue;
                     uint64_t ad = a + o;
                     if (ad >= b0 && ad < b1) continue;
-                    if (hits.size() >= MAXHITS) { trunc = true; break; }
+                    if (HN >= MAXHITS) { trunc = true; break; }
                     Hit h; h.addr = ad; h.old = 0;
                     memcpy(&h.old, &buf[o], sz);
-                    hits.push_back(h);
+                    H[HN++] = h;
                 }
-                if (usable) adv = usable;
+                adv = usable;
+            } else {
+                rdFail += want;
+                adv = std::min<size_t>(want, 4096);
             }
             a += adv;
         }
         if (trunc) break;
     }
     if (trunc) outbuf += "[peringatan] hasil dipotong di 3000000, persempit nilai/ranges\n";
-    lua_pushinteger(s, (lua_Integer)hits.size());
+    if (rdFail) {
+        char b[160];
+        snprintf(b, sizeof b, "[info] dibaca %.1f MB, gagal baca %.1f MB\n", rdOK / 1048576.0, rdFail / 1048576.0);
+        outbuf += b;
+    }
+    lua_pushinteger(s, (lua_Integer)HN);
     return 1;
 }
 
@@ -242,10 +405,10 @@ static int l_search(lua_State* s) {
 static int doRefine(lua_State* s, int mode, const Cond* c) {
     int t = curType;
     size_t k = 0;
-    for (size_t i = 0; i < hits.size(); i++) {
-        Hit h = hits[i];
+    for (size_t i = 0; i < HN; i++) {
+        Hit h = H[i];
         uint64_t cur = 0;
-        if (pread64(memfd, &cur, TI[t].size, (off64_t)h.addr) != TI[t].size) continue;
+        if (!readRaw(h.addr, t, cur)) continue;
         bool keep = false;
         switch (mode) {
             case 0: keep = matchRaw(*c, (const uint8_t*)&cur); break;
@@ -254,9 +417,9 @@ static int doRefine(lua_State* s, int mode, const Cond* c) {
             case 3: keep = cmpRaw(t, cur, h.old) > 0; break;
             case 4: keep = cmpRaw(t, cur, h.old) < 0; break;
         }
-        if (keep) { h.old = cur; hits[k++] = h; }
+        if (keep) { h.old = cur; H[k++] = h; }
     }
-    hits.resize(k);
+    HN = k;
     lua_pushinteger(s, (lua_Integer)k);
     return 1;
 }
@@ -266,20 +429,24 @@ static int l_changed(lua_State* s) { return doRefine(s, 1, nullptr); }
 static int l_unchanged(lua_State* s) { return doRefine(s, 2, nullptr); }
 static int l_increased(lua_State* s) { return doRefine(s, 3, nullptr); }
 static int l_decreased(lua_State* s) { return doRefine(s, 4, nullptr); }
-static int l_count(lua_State* s) { lua_pushinteger(s, (lua_Integer)hits.size()); return 1; }
-static int l_clear(lua_State* s) { hits.clear(); hits.shrink_to_fit(); return 0; }
+static int l_count(lua_State* s) { lua_pushinteger(s, (lua_Integer)HN); return 1; }
+static int l_clear(lua_State*) {
+    HN = 0;
+    if (H) madvise(H, (size_t)MAXHITS * sizeof(Hit), MADV_DONTNEED);
+    return 0;
+}
 
 static int l_results(lua_State* s) {
     size_t n = (size_t)luaL_optinteger(s, 1, 20);
     size_t off = (size_t)luaL_optinteger(s, 2, 0);
     lua_newtable(s);
     int idx = 1;
-    for (size_t i = off; i < hits.size() && i < off + n; i++) {
+    for (size_t i = off; i < HN && i < off + n; i++) {
         uint64_t cur;
         lua_newtable(s);
-        lua_pushinteger(s, (lua_Integer)hits[i].addr);
+        lua_pushinteger(s, (lua_Integer)H[i].addr);
         lua_setfield(s, -2, "addr");
-        if (readRaw(hits[i].addr, curType, cur)) pushVal(s, curType, cur); else lua_pushnil(s);
+        if (readRaw(H[i].addr, curType, cur)) pushVal(s, curType, cur); else lua_pushnil(s);
         lua_setfield(s, -2, "value");
         lua_rawseti(s, -2, idx++);
     }
@@ -299,15 +466,15 @@ static int l_write(lua_State* s) {
     uint64_t a = (uint64_t)luaL_checkinteger(s, 1);
     int t = getType(s, 3);
     uint64_t raw = toRaw(s, 2, t);
-    lua_pushboolean(s, pwrite64(memfd, &raw, TI[t].size, (off64_t)a) == TI[t].size);
+    lua_pushboolean(s, memWrite(a, &raw, (size_t)TI[t].size));
     return 1;
 }
 
 static int l_editAll(lua_State* s) {
     uint64_t raw = toRaw(s, 1, curType);
     size_t ok = 0;
-    for (auto& h : hits)
-        if (pwrite64(memfd, &raw, TI[curType].size, (off64_t)h.addr) == TI[curType].size) { h.old = raw; ok++; }
+    for (size_t i = 0; i < HN; i++)
+        if (memWriteFast(H[i].addr, &raw, (size_t)TI[curType].size)) { H[i].old = raw; ok++; }
     lua_pushinteger(s, (lua_Integer)ok);
     return 1;
 }
@@ -321,7 +488,7 @@ static void* freezer(void*) {
     for (;;) {
         usleep(30000);
         std::lock_guard<std::mutex> g(FM);
-        for (auto& f : fz) pwrite64(memfd, &f.raw, TI[f.t].size, (off64_t)f.addr);
+        for (auto& f : fz) memWriteFast(f.addr, &f.raw, (size_t)TI[f.t].size);
     }
     return nullptr;
 }
@@ -347,8 +514,8 @@ static int l_freeze(lua_State* s) {
 
 static int l_freezeAll(lua_State* s) {
     uint64_t raw = toRaw(s, 1, curType);
-    for (auto& h : hits) addFreeze(h.addr, curType, raw);
-    lua_pushinteger(s, (lua_Integer)hits.size());
+    for (size_t i = 0; i < HN; i++) addFreeze(H[i].addr, curType, raw);
+    lua_pushinteger(s, (lua_Integer)HN);
     return 1;
 }
 
@@ -378,13 +545,19 @@ function gg.hex(n) return string.format("0x%x", n) end
 
 static void doInit(const std::string& dir) {
     if (L) return;
-    memfd = open("/proc/self/mem", O_RDWR | O_CLOEXEC);
+    if (pipe2(rp, O_NONBLOCK | O_CLOEXEC) != 0) rp[0] = rp[1] = -1;
+    if (pipe2(wp, O_NONBLOCK | O_CLOEXEC) != 0) wp[0] = wp[1] = -1;
+    void* m = mmap(nullptr, (size_t)MAXHITS * sizeof(Hit), PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    H = (m == MAP_FAILED) ? nullptr : (Hit*)m;
+    setSpec(spec);
     L = luaL_newstate();
     luaL_openlibs(L);
     lua_pushcfunction(L, l_print);
     lua_setglobal(L, "print");
     static const luaL_Reg fns[] = {
-        {"ranges", l_ranges}, {"maps", l_maps}, {"base", l_base},
+        {"ranges", l_ranges}, {"regions", l_regions}, {"probe", l_probe},
+        {"maps", l_maps}, {"base", l_base},
         {"search", l_search}, {"refine", l_refine},
         {"changed", l_changed}, {"unchanged", l_unchanged},
         {"increased", l_increased}, {"decreased", l_decreased},
@@ -401,12 +574,13 @@ static void doInit(const std::string& dir) {
     luaL_dostring(L, pp.c_str());
     luaL_dostring(L, PRELUDE);
     lua_settop(L, 0);
+    initMsg = probeText();
     std::string a = dir + "/autoexec.lua";
     if (access(a.c_str(), R_OK) == 0) {
         outbuf.clear();
         if (luaL_dofile(L, a.c_str())) {
-            initMsg = std::string("autoexec error: ") + lua_tostring(L, -1) + "\n";
-        } else initMsg = outbuf;
+            initMsg += std::string("autoexec error: ") + lua_tostring(L, -1) + "\n";
+        } else initMsg += outbuf;
         lua_settop(L, 0);
     }
 }
