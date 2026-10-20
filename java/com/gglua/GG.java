@@ -34,9 +34,10 @@ public class GG {
     private static ScrollView sv;
     private static EditText in;
     private static int hi = 0;
+    private static boolean onShell = false;
 
     private static native void nativeInit(String dir);
-    private static native String nativeRun(String code);
+    static native String nativeRun(String code);
 
     public static void init(final Activity act) {
         UI.postDelayed(new Runnable() {
@@ -125,8 +126,45 @@ public class GG {
         }));
         p.addView(row, new LinearLayout.LayoutParams(-1, -2));
 
+        p.removeAllViews();
+        final LinearLayout shell = new LinearLayout(act);
+        shell.setOrientation(LinearLayout.VERTICAL);
+        shell.addView(sv, new LinearLayout.LayoutParams(-1, 0, 1f));
+        shell.addView(row, new LinearLayout.LayoutParams(-1, -2));
+        final LinearLayout gui = GGPanel.build(act);
+        final TextView tg = tabv(act, "GUI"), ts = tabv(act, "Shell");
+        LinearLayout bar = new LinearLayout(act);
+        bar.addView(tg, new LinearLayout.LayoutParams(0, -2, 1f));
+        bar.addView(ts, new LinearLayout.LayoutParams(0, -2, 1f));
+        p.addView(bar, new LinearLayout.LayoutParams(-1, -2));
+        p.addView(gui, new LinearLayout.LayoutParams(-1, 0, 1f));
+        p.addView(shell, new LinearLayout.LayoutParams(-1, 0, 1f));
+        shell.setVisibility(View.GONE);
+        tg.setBackgroundColor(0xFF1E88E5);
+        tg.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                onShell = false;
+                gui.setVisibility(View.VISIBLE);
+                shell.setVisibility(View.GONE);
+                tg.setBackgroundColor(0xFF1E88E5);
+                ts.setBackgroundColor(0xFF333844);
+                ime(false);
+            }
+        });
+        ts.setOnClickListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                onShell = true;
+                gui.setVisibility(View.GONE);
+                shell.setVisibility(View.VISIBLE);
+                ts.setBackgroundColor(0xFF1E88E5);
+                tg.setBackgroundColor(0xFF333844);
+                in.requestFocus();
+                ime(true);
+            }
+        });
+
         FrameLayout.LayoutParams pl = new FrameLayout.LayoutParams(-1,
-                (int) (act.getResources().getDisplayMetrics().heightPixels * 0.5f));
+                (int) (act.getResources().getDisplayMetrics().heightPixels * 0.62f));
         pl.gravity = Gravity.TOP;
         pl.setMargins(dp(6), dp(6), dp(6), 0);
         p.setVisibility(View.GONE);
@@ -172,6 +210,16 @@ public class GG {
         btn = b;
     }
 
+    private static TextView tabv(Activity act, String t) {
+        TextView v = new TextView(act);
+        v.setText(t);
+        v.setTextColor(Color.WHITE);
+        v.setGravity(Gravity.CENTER);
+        v.setPadding(0, dp(8), 0, dp(8));
+        v.setBackgroundColor(0xFF333844);
+        return v;
+    }
+
     private static Button mk(String t, View.OnClickListener l) {
         Button b = new Button(cur);
         b.setText(t);
@@ -198,6 +246,7 @@ public class GG {
     }
 
     private static void ime(boolean show) {
+        if (show && !onShell) return;
         try {
             InputMethodManager m = (InputMethodManager) cur.getSystemService(Context.INPUT_METHOD_SERVICE);
             if (show) m.showSoftInput(in, InputMethodManager.SHOW_IMPLICIT);
