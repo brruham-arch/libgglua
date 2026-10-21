@@ -13,6 +13,10 @@
 #include <string>
 #include <vector>
 #include <mutex>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <signal.h>
+#include <ctime>
 extern "C" {
 #include "lua.h"
 #include "lualib.h"
@@ -529,6 +533,236 @@ static int l_unfreeze(lua_State* s) {
 static int l_unfreezeAll(lua_State*) { std::lock_guard<std::mutex> g(FM); fz.clear(); return 0; }
 static int l_frozen(lua_State* s) { std::lock_guard<std::mutex> g(FM); lua_pushinteger(s, (lua_Integer)fz.size()); return 1; }
 
+/* ---------- backup / restore data aplikasi (proses sendiri) ---------- */
+static std::string gdir;
+struct CopyStat { size_t files = 0, bytes = 0, fail = 0; };
+
+static std::string pkgName() {
+    char b[256] = {0};
+    int fd = open("/proc/self/cmdline", O_RDONLY);
+    if (fd < 0) return "";
+    ssize_t n = read(fd, b, sizeof b - 1);
+    close(fd);
+    if (n <= 0) return "";
+    std::string s(b);
+    size_t p = s.find(':');
+    return p == std::string::npos ? s : s.substr(0, p);
+}
+
+static void mkdirs(const std::string& p) {
+    for (size_t i = 1; i <= p.size(); i++)
+        if (i == p.size() || p[i] == '/') mkdir(p.substr(0, i).c_str(), 0771);
+}
+
+static bool startsWith(const std::string& a, const std::string& p) {
+    return a.size() >= p.size() && a.compare(0, p.size(), p) == 0;
+}
+
+static bool excludedTop(const char* n) {
+    size_t l = strlen(n);
+    if (!strcmp(n, "cache") || !strcmp(n, "code_cache") || !strcmp(n, "lib") || !strcmp(n, "no_backup")) return true;
+    return l > 3 && !strcmp(n + l - 3, ".so");
+}
+
+static bool okName(const char* n) {
+    size_t l = strlen(n);
+    if (!l || l > 48) return false;
+    for (size_t i = 0; i < l; i++)
+        if (!isalnum((unsigned char)n[i]) && n[i] != '_' && n[i] != '-') return false;
+    return true;
+}
+
+static bool copyOne(const std::string& s, const std::string& d, const struct stat& st) {
+    int in = open(s.c_str(), O_RDONLY | O_CLOEXEC);
+    if (in < 0) return false;
+    int out = open(d.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, (st.st_mode & 0777) | 0600);
+    if (out < 0) { close(in); return false; }
+    std::vector<char> buf(65536);
+    bool ok = true;
+    for (;;) {
+        ssize_t n = read(in, buf.data(), buf.size());
+        if (n < 0) { ok = false; break; }
+        if (n == 0) break;
+        ssize_t o = 0;
+        while (o < n) {
+            ssize_t w = write(out, buf.data() + o, (size_t)(n - o));
+            if (w <= 0) { ok = false; break; }
+            o += w;
+        }
+        if (!ok) break;
+    }
+    struct timespec ts[2] = {st.st_atim, st.st_mtim};
+    futimens(out, ts);
+    close(in);
+    close(out);
+    return ok;
+}
+
+static void copyEntry(const std::string& sp, const std::string& dp, const std::string& skip, CopyStat& cs);
+
+static void copyTree(const std::string& s, const std::string& d, const std::string& skip, CopyStat& cs, bool top) {
+    DIR* dh = opendir(s.c_str());
+    if (!dh) { cs.fail++; return; }
+    mkdirs(d);
+    while (dirent* e = readdir(dh)) {
+        const char* n = e->d_name;
+        if (!strcmp(n, ".") || !strcmp(n, "..")) continue;
+        if (top && excludedTop(n)) continue;
+        copyEntry(s + "/" + n, d + "/" + n, skip, cs);
+    }
+    closedir(dh);
+}
+
+static void copyEntry(const std::string& sp, const std::string& dp, const std::string& skip, CopyStat& cs) {
+    if (sp == skip) return;
+    struct stat st;
+    if (lstat(sp.c_str(), &st) != 0) { cs.fail++; return; }
+    if (S_ISDIR(st.st_mode)) copyTree(sp, dp, skip, cs, false);
+    else if (S_ISREG(st.st_mode)) {
+        if (copyOne(sp, dp, st)) { cs.files++; cs.bytes += (size_t)st.st_size; } else cs.fail++;
+    }
+}
+
+static void rmTree(const std::string& p, const std::string& skip) {
+    if (p == skip) return;
+    struct stat st;
+    if (lstat(p.c_str(), &st) != 0) return;
+    if (!S_ISDIR(st.st_mode)) { unlink(p.c_str()); return; }
+    std::vector<std::string> v;
+    DIR* dh = opendir(p.c_str());
+    if (dh) {
+        while (dirent* e = readdir(dh)) {
+            const char* n = e->d_name;
+            if (!strcmp(n, ".") || !strcmp(n, "..")) continue;
+            v.push_back(n);
+        }
+        closedir(dh);
+    }
+    for (auto& n : v) rmTree(p + "/" + n, skip);
+    if (skip.empty() || !startsWith(skip, p + "/")) rmdir(p.c_str());
+}
+
+static void clearTop(const std::string& dir, const std::string& skip) {
+    std::vector<std::string> v;
+    DIR* dh = opendir(dir.c_str());
+    if (!dh) return;
+    while (dirent* e = readdir(dh)) {
+        const char* n = e->d_name;
+        if (!strcmp(n, ".") || !strcmp(n, "..") || excludedTop(n)) continue;
+        v.push_back(n);
+    }
+    closedir(dh);
+    for (auto& n : v) rmTree(dir + "/" + n, skip);
+}
+
+static bool readMeta(const std::string& p, long& t, unsigned long long& files, unsigned long long& bytes) {
+    FILE* f = fopen(p.c_str(), "r");
+    if (!f) return false;
+    char ln[128];
+    t = 0; files = bytes = 0;
+    while (fgets(ln, sizeof ln, f)) {
+        sscanf(ln, "time=%ld", &t);
+        sscanf(ln, "files=%llu", &files);
+        sscanf(ln, "bytes=%llu", &bytes);
+    }
+    fclose(f);
+    return true;
+}
+
+static void* killer(void*) { sleep(2); kill(getpid(), SIGKILL); return nullptr; }
+
+static int l_pkg(lua_State* s) { lua_pushstring(s, pkgName().c_str()); return 1; }
+
+static int l_backup(lua_State* s) {
+    const char* nm = luaL_checkstring(s, 1);
+    bool ext = lua_isnoneornil(s, 2) ? true : (lua_toboolean(s, 2) != 0);
+    if (!okName(nm)) return luaL_error(s, "nama slot: huruf/angka/_/- maks 48");
+    std::string pkg = pkgName();
+    std::string dd = "/data/data/" + pkg, ed = "/storage/emulated/0/Android/data/" + pkg;
+    struct stat st;
+    if (pkg.empty() || stat(dd.c_str(), &st) != 0) return luaL_error(s, "data dir tidak ditemukan: %s", dd.c_str());
+    std::string root = gdir + "/backup", slot = root + "/" + nm;
+    rmTree(slot, "");
+    CopyStat cs;
+    copyTree(dd, slot + "/data", root, cs, true);
+    bool hasExt = false;
+    if (ext && stat(ed.c_str(), &st) == 0) { copyTree(ed, slot + "/ext", root, cs, true); hasExt = true; }
+    FILE* f = fopen((slot + "/meta.txt").c_str(), "w");
+    if (f) {
+        fprintf(f, "time=%ld\nfiles=%zu\nbytes=%zu\next=%d\npkg=%s\n", (long)time(nullptr), cs.files, cs.bytes, hasExt ? 1 : 0, pkg.c_str());
+        fclose(f);
+    }
+    char b[200];
+    snprintf(b, sizeof b, "backup '%s': %zu file, %.1f MB, gagal %zu\n", nm, cs.files, cs.bytes / 1048576.0, cs.fail);
+    outbuf += b;
+    lua_pushinteger(s, (lua_Integer)cs.files);
+    return 1;
+}
+
+static int l_restore(lua_State* s) {
+    const char* nm = luaL_checkstring(s, 1);
+    bool doKill = lua_isnoneornil(s, 2) ? true : (lua_toboolean(s, 2) != 0);
+    if (!okName(nm)) return luaL_error(s, "nama slot tidak valid");
+    std::string pkg = pkgName();
+    std::string dd = "/data/data/" + pkg, ed = "/storage/emulated/0/Android/data/" + pkg;
+    std::string root = gdir + "/backup", slot = root + "/" + nm;
+    struct stat st;
+    if (pkg.empty() || stat((slot + "/meta.txt").c_str(), &st) != 0) return luaL_error(s, "slot tidak ada: %s", nm);
+    CopyStat cs;
+    clearTop(dd, root);
+    copyTree(slot + "/data", dd, root, cs, false);
+    if (stat((slot + "/ext").c_str(), &st) == 0) {
+        clearTop(ed, root);
+        copyTree(slot + "/ext", ed, root, cs, false);
+    }
+    char b[200];
+    snprintf(b, sizeof b, "restore '%s': %zu file, %.1f MB, gagal %zu\n", nm, cs.files, cs.bytes / 1048576.0, cs.fail);
+    outbuf += b;
+    if (doKill) {
+        pthread_t th;
+        pthread_create(&th, nullptr, killer, nullptr);
+        pthread_detach(th);
+        outbuf += "game ditutup 2 detik lagi, buka ulang manual\n";
+    }
+    lua_pushinteger(s, (lua_Integer)cs.files);
+    return 1;
+}
+
+static int l_backups(lua_State* s) {
+    std::string root = gdir + "/backup";
+    int n = 0;
+    std::vector<std::string> v;
+    DIR* dh = opendir(root.c_str());
+    if (dh) {
+        while (dirent* e = readdir(dh)) { if (e->d_name[0] != '.') v.push_back(e->d_name); }
+        closedir(dh);
+    }
+    std::sort(v.begin(), v.end());
+    for (auto& nm : v) {
+        long t; unsigned long long f, b;
+        if (!readMeta(root + "/" + nm + "/meta.txt", t, f, b)) continue;
+        char ts[32] = "?";
+        time_t tt = (time_t)t;
+        struct tm lt;
+        if (localtime_r(&tt, &lt)) strftime(ts, sizeof ts, "%Y-%m-%d %H:%M", &lt);
+        char ln[200];
+        snprintf(ln, sizeof ln, "%-16s %s  %llu file  %.1f MB\n", nm.c_str(), ts, f, b / 1048576.0);
+        outbuf += ln;
+        n++;
+    }
+    if (!n) outbuf += "(belum ada backup)\n";
+    lua_pushinteger(s, n);
+    return 1;
+}
+
+static int l_delbackup(lua_State* s) {
+    const char* nm = luaL_checkstring(s, 1);
+    if (!okName(nm)) return luaL_error(s, "nama slot tidak valid");
+    rmTree(gdir + "/backup/" + nm, "");
+    lua_pushboolean(s, 1);
+    return 1;
+}
+
 /* ---------- init & run ---------- */
 static const char* PRELUDE = R"LUA(
 function gg.show(n, off)
@@ -545,6 +779,7 @@ function gg.hex(n) return string.format("0x%x", n) end
 
 static void doInit(const std::string& dir) {
     if (L) return;
+    gdir = dir;
     if (pipe2(rp, O_NONBLOCK | O_CLOEXEC) != 0) rp[0] = rp[1] = -1;
     if (pipe2(wp, O_NONBLOCK | O_CLOEXEC) != 0) wp[0] = wp[1] = -1;
     void* m = mmap(nullptr, (size_t)MAXHITS * sizeof(Hit), PROT_READ | PROT_WRITE,
@@ -565,6 +800,7 @@ static void doInit(const std::string& dir) {
         {"read", l_read}, {"write", l_write}, {"editAll", l_editAll},
         {"freeze", l_freeze}, {"freezeAll", l_freezeAll},
         {"unfreeze", l_unfreeze}, {"unfreezeAll", l_unfreezeAll}, {"frozen", l_frozen},
+        {"backup", l_backup}, {"backups", l_backups}, {"restore", l_restore}, {"delbackup", l_delbackup}, {"pkg", l_pkg},
         {nullptr, nullptr}};
     luaL_newlib(L, fns);
     lua_pushstring(L, dir.c_str());
